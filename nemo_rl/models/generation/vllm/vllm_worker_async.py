@@ -53,7 +53,9 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
+    normalize_tool_call_arguments,
     replace_prefix_tokens,
+    resolve_terminator_token_ids,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
@@ -763,6 +765,11 @@ class VllmAsyncGenerationWorkerImpl(
         )
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
+        # Read generation_config.json once: try_get_generation_config() hits disk.
+        # The terminator set it feeds is what makes the multi-turn prefix splice
+        # work for models whose turns do not end on tokenizer.eos_token_id.
+        _terminator_generation_config = model_config.try_get_generation_config()
+
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
@@ -830,6 +837,14 @@ class VllmAsyncGenerationWorkerImpl(
                 for message in messages:
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
+
+                # An agent replaying its own tool calls sends OpenAI's wire form,
+                # where function.arguments is a JSON string. Some templates require
+                # a mapping and reject the string (Gemma-4 raises TemplateError), so
+                # normalize before either render below. In place, ahead of the
+                # deepcopy, so the splice's template_prefix render agrees with the
+                # full render -- a mismatch there would move the splice boundary.
+                normalize_tool_call_arguments(messages)
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
@@ -947,6 +962,9 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    terminator_ids=resolve_terminator_token_ids(
+                        self.renderer.tokenizer, _terminator_generation_config
+                    ),
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids

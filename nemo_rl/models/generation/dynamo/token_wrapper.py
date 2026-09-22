@@ -27,7 +27,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    normalize_tool_call_arguments,
+    replace_prefix_tokens,
+)
 
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
@@ -220,33 +223,11 @@ def _normalize_tool_arguments_for_template(
 ) -> None:
     """Make OpenAI tool calls renderable by model chat templates.
 
-    OpenAI chat messages carry ``function.arguments`` as a JSON string, while
-    some model templates iterate those arguments as a mapping. Normalize only
-    the local template copy; the request forwarded to Dynamo retains its
-    original OpenAI payload.
+    Normalizes only the local template copy; the request forwarded to Dynamo
+    retains its original OpenAI payload. The logic itself is shared with the vLLM
+    server -- see :func:`normalize_tool_call_arguments`.
     """
-    for message in messages[:before_index]:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function", tool_call)
-            if not isinstance(function, dict):
-                continue
-            arguments = function.get("arguments")
-            if not isinstance(arguments, str):
-                continue
-            try:
-                parsed_arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                parsed_arguments = {}
-            function["arguments"] = (
-                parsed_arguments if isinstance(parsed_arguments, dict) else {}
-            )
+    normalize_tool_call_arguments(messages, before_index=before_index)
 
 
 def _validate_engine_data(
