@@ -54,7 +54,9 @@ dependencies = [
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
   # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Ceiling raised to 5.15.1 for the Automodel `main` bump (Automodel main pins
+  # transformers==5.15.1); the non-automodel extras still select 5.12.1.
+  "transformers>=5.5.0,<=5.15.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -129,7 +131,11 @@ fsdp = [
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
-  "nemo-automodel[moe]",
+  # [ffpa] adds the FFPA CuTeDSL kernel (ffpa-attn + nvidia-cutlass-dsl==4.6.2) used by
+  # Gemma4's model-owned CP ring for the head_dim=512 global-attention layers
+  # (text_config.cp_full_attn_backend="ffpa"). Without it the ring silently falls back
+  # to compiled FlexAttention, which is ~3x slower fwd / ~6x slower bwd on those layers.
+  "nemo-automodel[moe,ffpa]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -139,8 +145,8 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors nemo-automodel's own `transformers==5.15.1` pin (Automodel main @ e4f0cc9).
+  "transformers==5.15.1",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",

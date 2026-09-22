@@ -107,6 +107,23 @@ class PY_EXECUTABLES:
         f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
     )
 
+    # Extras behind each constant above, for NEMO_RL_PY_EXECUTABLE_BY_EXTRAS lookups.
+    # Keep in sync with the constants; BASE/SYSTEM are the empty extras set.
+    _EXTRAS_BY_NAME: dict[str, tuple[str, ...]] = {
+        "BASE": (),
+        "VLLM": ("vllm",),
+        "FSDP": ("fsdp",),
+        "AUTOMODEL": ("automodel",),
+        "MCORE": ("mcore",),
+        "NEMO_GYM": ("nemo_gym",),
+        "VLLM_GYM": ("nemo_gym", "vllm"),
+        "SGLANG": ("sglang",),
+        "TRTLLM": ("trtllm",),
+        "MODELOPT_VLLM": ("modelopt", "vllm"),
+        "MODELOPT_AUTOMODEL": ("automodel", "modelopt"),
+        "MODELOPT_MCORE": ("mcore", "modelopt"),
+    }
+
     @classmethod
     def _resolve_system_overrides(cls) -> None:
         """Rewrite every uv command constant to the system executable when the flag is set."""
@@ -115,8 +132,62 @@ class PY_EXECUTABLES:
         for name in [n for n in vars(cls) if n.isupper()]:
             setattr(cls, name, cls.SYSTEM)
 
+    @classmethod
+    def _resolve_explicit_overrides(cls) -> None:
+        """Point individual extras sets at pre-built interpreters (see py_executable_overrides)."""
+        overrides = py_executable_overrides()
+        if not overrides:
+            return
+        for name, extras in cls._EXTRAS_BY_NAME.items():
+            interpreter = overrides.get(frozenset(extras))
+            if interpreter is not None:
+                setattr(cls, name, interpreter)
+
+
+def py_executable_overrides() -> dict[frozenset[str], str]:
+    """Parse NEMO_RL_PY_EXECUTABLE_BY_EXTRAS into {extras set: interpreter path}.
+
+    Escape hatch for environments where `uv run --locked` cannot build the per-actor
+    venvs -- e.g. an air-gapped or partially firewalled network that cannot reach the
+    explicit torch / flashinfer indexes pyproject declares. Unlike
+    NEMO_RL_PY_EXECUTABLES_SYSTEM, which collapses *every* actor onto the driver
+    interpreter, this keeps mutually conflicting extras (automodel vs vllm, which pin
+    different transformers versions) in separate pre-built interpreters.
+
+    Format is `extras=path` entries separated by `;`, where extras is a comma-separated
+    list matching an entry of PY_EXECUTABLES._EXTRAS_BY_NAME (order-insensitive) and an
+    empty extras list denotes the base environment:
+
+        NEMO_RL_PY_EXECUTABLE_BY_EXTRAS="=/venvs/base/bin/python;automodel=/venvs/am/bin/python;vllm=/venvs/vllm/bin/python"
+
+    Raises:
+        ValueError: If an entry is malformed or names a nonexistent interpreter.
+    """
+    spec = os.environ.get("NEMO_RL_PY_EXECUTABLE_BY_EXTRAS", "").strip()
+    if not spec:
+        return {}
+    overrides: dict[frozenset[str], str] = {}
+    for entry in spec.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"Malformed NEMO_RL_PY_EXECUTABLE_BY_EXTRAS entry {entry!r}: expected 'extras=path'"
+            )
+        extras_str, _, path = entry.partition("=")
+        path = path.strip()
+        if not os.path.exists(path):
+            raise ValueError(
+                f"NEMO_RL_PY_EXECUTABLE_BY_EXTRAS points at a nonexistent interpreter: {path!r}"
+            )
+        extras = frozenset(e.strip() for e in extras_str.split(",") if e.strip())
+        overrides[extras] = path
+    return overrides
+
 
 PY_EXECUTABLES._resolve_system_overrides()
+PY_EXECUTABLES._resolve_explicit_overrides()
 
 
 def uv_py_executable(extras: Sequence[str]) -> str:
@@ -128,6 +199,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
     """
     if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
         return PY_EXECUTABLES.SYSTEM
+    override = py_executable_overrides().get(frozenset(extras))
+    if override is not None:
+        return override
     extra_flags = "".join(f"--extra {extra} " for extra in extras)
     return f"uv run --locked {extra_flags}--directory {git_root}"
 
