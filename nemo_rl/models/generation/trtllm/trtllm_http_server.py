@@ -211,11 +211,18 @@ def create_app(
             effective_template_kwargs,
         )
 
+        # _eos_token_ids is already the effective EOS set (tokenizer + generation
+        # config + stop_token_ids), which is exactly the terminator set the splice
+        # needs; without it the boundary search would use the scalar EOS alone and
+        # miss models whose turns end on a distinct control token.
         adj_prompt = replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
+            # `or None` so a model with no EOS anywhere still raises the original
+            # "Tokenizer must have an EOS token ID" rather than an empty-set error.
+            terminator_ids=_eos_token_ids or None,
         )
 
         max_tokens_requested = (

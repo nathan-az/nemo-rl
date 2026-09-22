@@ -15,7 +15,11 @@
 
 import pytest
 
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    normalize_tool_call_arguments,
+    replace_prefix_tokens,
+    resolve_terminator_token_ids,
+)
 
 
 def test_replace_prefix_tokens_empty_model_prefix_returns_template():
@@ -145,3 +149,183 @@ def test_replace_prefix_tokens_qwen3_think_shift_picks_assistant_eos_not_user_eo
 
     assert result == [11, 12, 99, 99, 99, 55, 2, 70, 71, 2, 40, 41]
     assert 70 in result and 71 in result
+
+
+# --- terminator resolution -------------------------------------------------
+
+
+class _GemmaLikeTokenizer:
+    """Gemma-4's shape: a scalar EOS that never appears in a rendered turn."""
+
+    eos_token_id = 1
+
+    def decode(self, ids, **kwargs):
+        return " ".join(str(i) for i in ids)
+
+
+def test_resolve_terminator_token_ids_unions_tokenizer_and_generation_config():
+    """generation_config.json's list is authoritative; the tokenizer's EOS joins it."""
+    assert resolve_terminator_token_ids(
+        _GemmaLikeTokenizer(), {"eos_token_id": [1, 106, 50]}
+    ) == {1, 106, 50}
+
+
+def test_resolve_terminator_token_ids_accepts_scalar_generation_config():
+    assert resolve_terminator_token_ids(_GemmaLikeTokenizer(), {"eos_token_id": 2}) == {
+        1,
+        2,
+    }
+
+
+def test_resolve_terminator_token_ids_without_generation_config_is_just_the_tokenizer():
+    """Preserves the pre-existing behaviour for callers with nothing else to offer."""
+    assert resolve_terminator_token_ids(_GemmaLikeTokenizer()) == {1}
+    assert resolve_terminator_token_ids(_GemmaLikeTokenizer(), {}) == {1}
+    assert resolve_terminator_token_ids(_GemmaLikeTokenizer(), {"top_p": 0.95}) == {1}
+
+
+def test_resolve_terminator_token_ids_tolerates_missing_eos():
+    class _NoEos:
+        eos_token_id = None
+
+    assert resolve_terminator_token_ids(_NoEos()) == set()
+
+
+# --- the Gemma-4 regression ------------------------------------------------
+#
+# Token IDs below are the real ones, measured against google/gemma-4-31B-it:
+# 1 = <eos>, 50 = <|tool_response>, 106 = <turn|>, 107 = "\n". A turn ends on
+# 106, or on 50 inside a tool loop; 1 appears nowhere in a rendered
+# conversation. The scenario is the production one -- turn 1 the policy emits a
+# tool call and stops, the agent appends the tool response, turn 2 re-renders.
+
+_GEMMA_MODEL_PREFIX = [2, 105, 20, 106, 105, 30, 48, 31, 49, 50]
+_GEMMA_TEMPLATE_PREFIX = [2, 105, 20, 106, 105, 30, 48, 31, 49, 50, 107]
+_GEMMA_TEMPLATE = [2, 105, 20, 106, 105, 30, 48, 31, 49, 50, 107, 51, 106, 105, 40]
+
+
+def test_replace_prefix_tokens_gemma4_scalar_eos_raises_with_actionable_message():
+    """The defect: Gemma-4's scalar EOS is absent from every render, so the
+    terminator count is 0 and there is no boundary to find. Must fail loudly and
+    name the fix rather than reporting a confusing "EOS #0 not found".
+    """
+    with pytest.raises(AssertionError, match="No terminator token found"):
+        replace_prefix_tokens(
+            tokenizer=_GemmaLikeTokenizer(),
+            model_prefix_token_ids=_GEMMA_MODEL_PREFIX,
+            template_prefix_token_ids=_GEMMA_TEMPLATE_PREFIX,
+            template_token_ids=_GEMMA_TEMPLATE,
+        )
+
+
+def test_replace_prefix_tokens_gemma4_generation_config_terminators_reproduce_template():
+    """With generation_config.json's [1, 106, 50] the splice succeeds, and because
+    Gemma-4 has no retokenization drift it must reproduce the template exactly.
+    """
+    result = replace_prefix_tokens(
+        tokenizer=_GemmaLikeTokenizer(),
+        model_prefix_token_ids=_GEMMA_MODEL_PREFIX,
+        template_prefix_token_ids=_GEMMA_TEMPLATE_PREFIX,
+        template_token_ids=_GEMMA_TEMPLATE,
+        terminator_ids={1, 106, 50},
+    )
+    assert result == _GEMMA_TEMPLATE
+    # Gym chains per-call deltas by hash, so this is the load-bearing property.
+    assert result[: len(_GEMMA_MODEL_PREFIX)] == _GEMMA_MODEL_PREFIX
+
+
+def test_replace_prefix_tokens_gemma4_config_json_terminators_duplicate_tokens():
+    """config.json's [1, 106] omits <|tool_response> (50), so the count drops by
+    one, the boundary lands on the earlier <turn|>, and tokens are duplicated --
+    silently, which is worse than the crash. Pinned so nobody "fixes" the bug by
+    reaching for config.json.
+    """
+    result = replace_prefix_tokens(
+        tokenizer=_GemmaLikeTokenizer(),
+        model_prefix_token_ids=_GEMMA_MODEL_PREFIX,
+        template_prefix_token_ids=_GEMMA_TEMPLATE_PREFIX,
+        template_token_ids=_GEMMA_TEMPLATE,
+        terminator_ids={1, 106},
+    )
+    assert result != _GEMMA_TEMPLATE
+    assert len(result) > len(_GEMMA_TEMPLATE)
+
+
+def test_replace_prefix_tokens_trims_model_prefix_ending_on_nonscalar_terminator():
+    """The trim-trailing-terminator step must also recognize non-EOS terminators,
+    or the spliced output carries a duplicate turn-end token.
+    """
+    result = replace_prefix_tokens(
+        tokenizer=_GemmaLikeTokenizer(),
+        model_prefix_token_ids=[2, 105, 30, 106],
+        template_prefix_token_ids=[2, 105, 30, 106],
+        template_token_ids=[2, 105, 30, 106, 105, 40],
+        terminator_ids={1, 106},
+    )
+    assert result == [2, 105, 30, 106, 105, 40]
+
+
+def test_replace_prefix_tokens_empty_terminator_ids_raises():
+    with pytest.raises(AssertionError, match="must not be empty"):
+        replace_prefix_tokens(
+            tokenizer=_GemmaLikeTokenizer(),
+            model_prefix_token_ids=[1, 2],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2, 3],
+            terminator_ids=set(),
+        )
+
+
+# --- tool-call argument normalization --------------------------------------
+
+
+def test_normalize_tool_call_arguments_parses_the_openai_string_form():
+    """Gemma-4's template rejects a JSON string outright, so the wire form has to
+    be deserialized before rendering history.
+    """
+    messages = [
+        {"role": "user", "content": "find it"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": "search", "arguments": '{"q": "onboarding"}'}}
+            ],
+        },
+    ]
+    normalize_tool_call_arguments(messages)
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"q": "onboarding"}
+
+
+def test_normalize_tool_call_arguments_leaves_mappings_and_others_alone():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "s", "arguments": {"q": "x"}}}],
+        },
+        {"role": "user", "content": '{"not": "a tool call"}'},
+        {"role": "assistant", "content": "no tool calls here"},
+    ]
+    normalize_tool_call_arguments(messages)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"q": "x"}
+    assert messages[1]["content"] == '{"not": "a tool call"}'
+
+
+def test_normalize_tool_call_arguments_unparseable_becomes_empty_mapping():
+    """A template that renders empty arguments beats one that cannot render at all."""
+    messages = [
+        {"role": "assistant", "tool_calls": [{"function": {"arguments": "not json"}}]},
+        {"role": "assistant", "tool_calls": [{"function": {"arguments": "[1, 2]"}}]},
+    ]
+    normalize_tool_call_arguments(messages)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {}
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {}
+
+
+def test_normalize_tool_call_arguments_respects_before_index():
+    messages = [
+        {"role": "assistant", "tool_calls": [{"function": {"arguments": '{"a": 1}'}}]},
+        {"role": "assistant", "tool_calls": [{"function": {"arguments": '{"b": 2}'}}]},
+    ]
+    normalize_tool_call_arguments(messages, before_index=1)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"b": 2}'
