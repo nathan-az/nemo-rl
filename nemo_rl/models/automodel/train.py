@@ -229,6 +229,155 @@ def extract_logits(
         return outputs.logits
 
 
+def fused_linear_ce_enabled(cfg: PolicyConfig) -> bool:
+    """Whether ``policy.dtensor_cfg.fused_linear_ce`` is on."""
+    return bool(cfg.get("dtensor_cfg", {}).get("fused_linear_ce", False))
+
+
+def forward_hidden_states(
+    model: nn.Module, model_batch: dict[str, Any]
+) -> tuple[torch.Tensor, nn.Module]:
+    """Run the model, returning the final hidden states that feed the LM head.
+
+    A pre-hook on the output embedding captures its input and hands the head a
+    single position, so the ``[batch, seq, vocab]`` logits are never built. The
+    forward otherwise runs unchanged through the root module, keeping FSDP's
+    root hooks and the CP context in effect.
+    """
+    lm_head = model.get_output_embeddings()
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture(module: nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        captured["hidden_states"] = args[0]
+        return (args[0][:, -1:], *args[1:])
+
+    handle = lm_head.register_forward_pre_hook(_capture)
+    try:
+        outputs = model_forward(model, model_batch)
+    finally:
+        handle.remove()
+    del outputs
+    hidden_states = captured["hidden_states"]
+    if isinstance(hidden_states, DTensor):
+        raise NotImplementedError(
+            "policy.dtensor_cfg.fused_linear_ce does not support tensor parallelism."
+        )
+    return hidden_states, lm_head
+
+
+def _materialize_lm_head_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return a rank-local full LM-head weight with correct FSDP gradient semantics.
+
+    Under FSDP2 the tied Gemma LM head lives in the root unit, which stays
+    unsharded between forward and backward, so ``weight`` is normally a plain
+    tensor whose gradient FSDP reduces itself. A still-sharded DTensor is
+    gathered with Automodel's ``Partial``-gradient helper over its own mesh.
+    """
+    if not isinstance(weight, DTensor):
+        return weight
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    if weight.device_mesh.ndim != 1:
+        raise NotImplementedError(
+            "policy.dtensor_cfg.fused_linear_ce requires a 1-D FSDP mesh for the LM head, "
+            f"got mesh dims {weight.device_mesh.mesh_dim_names}."
+        )
+    return FusedLinearCrossEntropy.materialize_lm_weight(
+        weight, grad_reduce_group=weight.device_mesh.get_group()
+    )
+
+
+def fused_linear_next_token_logprobs(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    input_ids: torch.Tensor,
+    cp_sharder: Optional[ContextParallelSharder],
+    softcap: Optional[float],
+    sampling_params: Optional[TrainingSamplingParams],
+) -> torch.Tensor:
+    """Next-token logprobs from final hidden states via cut-cross-entropy.
+
+    Matches ``log_softmax(softcap(hidden @ W.T))`` gathered at the next token,
+    the quantity the logits path computes, without materializing logits.
+
+    Args:
+        hidden_states: Rank-local final hidden states, ``[B, S_local, H]``.
+        lm_head: Output embedding module (its weight is ``[V, H]``).
+        input_ids: Canonical token IDs, ``[B, S]``. Under CP these are the
+            unsharded ids; the sharder maps targets into the local layout.
+        cp_sharder: Sharder for this forward, or None without CP.
+        softcap: Final logit soft-cap, or None.
+        sampling_params: Must be None or temperature 1.0 without top-k/top-p.
+
+    Returns:
+        Canonical-order float32 logprobs, ``[B, S - 1]``.
+    """
+    from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY
+
+    if not HAVE_CUT_CROSS_ENTROPY:
+        raise ImportError(
+            "policy.dtensor_cfg.fused_linear_ce requires the cut-cross-entropy package."
+        )
+    from cut_cross_entropy import linear_cross_entropy
+
+    if need_top_k_or_top_p_filtering(sampling_params):
+        raise NotImplementedError(
+            "policy.dtensor_cfg.fused_linear_ce computes logprobs from unfiltered "
+            "logits; top-k/top-p training-time filtering is not supported."
+        )
+    # Folding 1/T into bf16 hidden states re-rounds them (~4e-2 logprob error at
+    # T=0.7), so only T=1 is supported rather than silently losing accuracy.
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        raise NotImplementedError(
+            "policy.dtensor_cfg.fused_linear_ce requires temperature 1.0, got "
+            f"{sampling_params.temperature}."
+        )
+
+    targets = input_ids.roll(shifts=-1, dims=1)
+    if cp_sharder is not None:
+        targets = cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=0)
+
+    # Run the head in the dtype the logits path would: under autocast the final
+    # hidden states can be fp32, but autocast computes lm_head in its own dtype.
+    # CCE's backward also requires bf16/fp16.
+    compute_dtype = (
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else hidden_states.dtype
+    )
+    if compute_dtype not in (torch.bfloat16, torch.float16):
+        raise NotImplementedError(
+            "policy.dtensor_cfg.fused_linear_ce requires bf16/fp16 compute, got "
+            f"{compute_dtype}."
+        )
+    hidden_states = hidden_states.to(compute_dtype)
+    weight = _materialize_lm_head_weight(lm_head.weight).to(compute_dtype)
+
+    batch_size, local_seq_len, hidden_size = hidden_states.shape
+    # cce_exact: no gradient filtering, fp32 gradient accumulation. The default
+    # "cce" preset accumulates the hidden-state gradient in bf16 (~10% error).
+    neg_ce = -linear_cross_entropy(
+        hidden_states.reshape(-1, hidden_size),
+        weight,
+        targets.reshape(-1).to(hidden_states.device),
+        softcap=softcap or None,
+        reduction="none",
+        shift=False,
+        impl="cce_exact",
+    )
+    logprobs = neg_ce.view(batch_size, local_seq_len).float()
+    if cp_sharder is not None:
+        logprobs = cp_sharder.gather_token_tensor(logprobs, seq_dim=1, trim=True)
+    return logprobs[:, : input_ids.shape[1] - 1]
+
+
+def _final_logit_softcap(model: nn.Module) -> Optional[float]:
+    config = model.config
+    if hasattr(config, "get_text_config"):
+        config = config.get_text_config()
+    return getattr(config, "final_logit_softcapping", None)
+
+
 def apply_temperature_scaling(
     logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
@@ -337,6 +486,44 @@ def forward_with_post_processing_fn(
             "ScorePostProcessor does not support context_parallel_size > 1 "
             "on the automodel backend. Set context_parallel_size=1."
         )
+
+    if getattr(post_processing_fn, "fused_linear_ce", False):
+        hidden_states, lm_head = forward_hidden_states(model, prepared.model_batch)
+        next_token_logprobs = fused_linear_next_token_logprobs(
+            hidden_states,
+            lm_head,
+            data_dict["input_ids"]
+            if cp_sharder is not None
+            else processed_inputs.input_ids,
+            cp_sharder,
+            _final_logit_softcap(model),
+            sampling_params,
+        )
+        del hidden_states
+        if isinstance(post_processing_fn, LossPostProcessor):
+            result, metrics = post_processing_fn(
+                logits=None,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                cp_sharder=cp_sharder,
+                sequence_dim=sequence_dim,
+                next_token_logprobs=next_token_logprobs,
+            )
+        else:
+            result = post_processing_fn(
+                logits=None,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=processed_mb.original_batch_size,
+                original_seq_len=processed_mb.original_seq_len,
+                cp_sharder=cp_sharder,
+                sequence_dim=sequence_dim,
+                next_token_logprobs=next_token_logprobs,
+            )
+            metrics = {"logprobs": result}
+        return result, metrics, processed_mb
 
     # Model forward pass
     outputs = model_forward(model, prepared.model_batch)
@@ -574,6 +761,17 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.fused_linear_ce = fused_linear_ce_enabled(cfg)
+        if self.fused_linear_ce:
+            if loss_fn.input_type != LossInputType.LOGPROB:
+                raise NotImplementedError(
+                    "policy.dtensor_cfg.fused_linear_ce requires a LOGPROB loss, got "
+                    f"{loss_fn.input_type}."
+                )
+            if enable_seq_packing:
+                raise NotImplementedError(
+                    "policy.dtensor_cfg.fused_linear_ce does not support sequence packing."
+                )
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -601,6 +799,7 @@ class LossPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
+        next_token_logprobs: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss from logits.
 
@@ -613,10 +812,20 @@ class LossPostProcessor:
             cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
                 when context parallelism is inactive.
             sequence_dim: Sequence dimension
+            next_token_logprobs: Canonical ``[B, S - 1]`` logprobs from the fused
+                linear-CE path; ``logits`` is then None.
 
         Returns:
             Tuple of (loss, metrics)
         """
+        if next_token_logprobs is not None:
+            return self.loss_fn(
+                data=data_dict,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                next_token_logprobs=next_token_logprobs,
+            )
+
         # Under CP, ``logits`` is this rank's local shard while ``data_dict``
         # stays canonical; the sharder maps between the two.
         token_layout = cp_sharder
@@ -694,6 +903,11 @@ class LogprobsPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+        self.fused_linear_ce = fused_linear_ce_enabled(cfg)
+        if self.fused_linear_ce and enable_seq_packing:
+            raise NotImplementedError(
+                "policy.dtensor_cfg.fused_linear_ce does not support sequence packing."
+            )
 
     def __call__(
         self,
@@ -705,6 +919,7 @@ class LogprobsPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
+        next_token_logprobs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute token log probabilities from logits.
 
@@ -717,13 +932,24 @@ class LogprobsPostProcessor:
             cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
                 when context parallelism is inactive.
             sequence_dim: Sequence dimension
+            next_token_logprobs: Canonical ``[B, S - 1]`` logprobs from the fused
+                linear-CE path; ``logits`` is then None.
 
         Returns:
             Token log probabilities tensor [batch_size, seq_length]
         """
         input_lengths = data_dict["input_lengths"]
 
-        if cp_sharder is not None:
+        if next_token_logprobs is not None:
+            # Fused linear-CE path: already canonical and shifted.
+            token_logprobs = next_token_logprobs
+            seq_len = (
+                data_dict["input_ids"].shape[1]
+                if cp_sharder is not None
+                else processed_inputs.seq_len
+            )
+            assert token_logprobs.shape[1] == seq_len - 1
+        elif cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
             # the model-facing tensors so Automodel's in-place buffer sharding
             # cannot reach the loss-side ones. Shift and gather against that
