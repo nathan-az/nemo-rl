@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -396,6 +397,40 @@ class DTensorPolicyWorkerV2Impl(
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
+    def _g4_dump_grads(self, out_dir: str) -> None:
+        """Save every parameter's pre-clip grad norm, plus full grads for a few tensors.
+
+        Full grads are kept for the tied embedding and for parameters whose name
+        matches ``G4_DUMP_GRADS_FULL`` (comma-separated substrings).
+        """
+        full_keys = [
+            k for k in os.environ.get("G4_DUMP_GRADS_FULL", "").split(",") if k
+        ]
+        rank = torch.distributed.get_rank()
+        norms: dict[str, float] = {}
+        full: dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            name = name.replace("._checkpoint_wrapped_module", "")
+            grad = param.grad
+            norm = torch.linalg.vector_norm(grad.float())
+            if isinstance(norm, DTensor):
+                norm = norm.full_tensor()
+            norms[name] = norm.item()
+            if "embed_tokens" in name or any(k in name for k in full_keys):
+                g = grad.full_tensor() if isinstance(grad, DTensor) else grad
+                if rank == 0:
+                    full[name] = g.detach().float().cpu()
+                del g
+        if rank == 0:
+            os.makedirs(out_dir, exist_ok=True)
+            idx = getattr(self, "_g4_dump_idx", 0)
+            path = os.path.join(out_dir, f"grads_{idx:03d}.pt")
+            torch.save({"norms": norms, "full": full}, path)
+            print(f"G4_DUMP_GRADS wrote {path} ({len(norms)} norms, {len(full)} full)", flush=True)
+        self._g4_dump_idx = getattr(self, "_g4_dump_idx", 0) + 1
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -523,6 +558,9 @@ class DTensorPolicyWorkerV2Impl(
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
+                # Parity-testing hack (off by default): dump pre-clip gradients.
+                if not eval_mode and os.environ.get("G4_DUMP_GRADS"):
+                    self._g4_dump_grads(os.environ["G4_DUMP_GRADS"])
                 if not eval_mode:
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
@@ -556,6 +594,17 @@ class DTensorPolicyWorkerV2Impl(
             # increment scheduler after all batches in rollout are processed
             if not eval_mode:
                 self.scheduler.step()
+            # Benchmarking hack (off by default): allocator peaks for this step, which nvidia-smi
+            # overstates by the cache, NCCL buffers and the CUDA context.
+            if os.environ.get("G4_LOG_PEAK_MEM") == "1":
+                print(
+                    f"G4_PEAK_MEM rank={torch.distributed.get_rank()} "
+                    f"max_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
+                    f"max_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB",
+                    flush=True,
+                )
+                torch.cuda.reset_peak_memory_stats()
+
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
             torch.cuda.empty_cache()

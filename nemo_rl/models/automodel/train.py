@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -371,6 +372,30 @@ def fused_linear_next_token_logprobs(
     return logprobs[:, : input_ids.shape[1] - 1]
 
 
+_G4_DUMP_COUNTER = [0]
+
+
+def _g4_dump_logprobs(out_dir, input_ids, input_lengths, logprobs, cp_sharder) -> None:
+    """Parity-testing hack (off by default): save canonical per-token logprobs."""
+    import torch.distributed as dist
+
+    cp_mesh = getattr(cp_sharder, "_cp_mesh", None)
+    if cp_mesh is not None and cp_mesh.get_local_rank() != 0:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    path = os.path.join(out_dir, f"rank{rank}_mb{_G4_DUMP_COUNTER[0]:04d}.pt")
+    _G4_DUMP_COUNTER[0] += 1
+    torch.save(
+        {
+            "input_ids": input_ids.detach().cpu(),
+            "input_lengths": input_lengths.detach().cpu(),
+            "logprobs": logprobs.detach().float().cpu(),
+        },
+        path,
+    )
+
+
 def _final_logit_softcap(model: nn.Module) -> Optional[float]:
     config = model.config
     if hasattr(config, "get_text_config"):
@@ -500,6 +525,14 @@ def forward_with_post_processing_fn(
             sampling_params,
         )
         del hidden_states
+        if os.environ.get("G4_DUMP_LOGPROBS"):
+            _g4_dump_logprobs(
+                os.environ["G4_DUMP_LOGPROBS"],
+                data_dict["input_ids"],
+                data_dict["input_lengths"],
+                next_token_logprobs,
+                cp_sharder,
+            )
         if isinstance(post_processing_fn, LossPostProcessor):
             result, metrics = post_processing_fn(
                 logits=None,
