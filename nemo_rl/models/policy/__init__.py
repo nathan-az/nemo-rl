@@ -212,6 +212,9 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    # Compute logprobs from final hidden states with cut-cross-entropy instead of
+    # materializing [batch, seq, vocab] logits (LOGPROB losses, TP=1, no packing).
+    fused_linear_ce: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
