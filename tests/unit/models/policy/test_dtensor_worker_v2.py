@@ -701,6 +701,38 @@ class TestDTensorParamsGenerator:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
 
+    @pytest.mark.parametrize("activation_checkpointing", [False, True])
+    def test_merges_lora_under_activation_checkpointing(self, activation_checkpointing):
+        """Refit must ship W + BA whether or not the block is checkpoint-wrapped.
+
+        CheckpointWrapper strips "._checkpoint_wrapped_module" from state_dict() keys but
+        not from named_modules() names, so a lookup keyed by the raw module name finds no
+        LinearLoRA under activation checkpointing and refit sends the base weight.
+        """
+        from nemo_automodel.components._peft.lora import LinearLoRA
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        torch.manual_seed(0)
+        block = nn.Module()
+        block.q_proj = LinearLoRA(nn.Linear(8, 8, bias=False), dim=2, alpha=4)
+        model = nn.Module()
+        model.layers = nn.ModuleList(
+            [checkpoint_wrapper(block) if activation_checkpointing else block]
+        )
+        # A trained adapter: lora_B starts at zero, which would make merged == base.
+        nn.init.normal_(block.q_proj.lora_B.weight)
+        q_proj = block.q_proj
+        merged = q_proj.weight + q_proj.scale * (
+            q_proj.lora_B.weight @ q_proj.lora_A.weight
+        )
+
+        results = dict(dtensor_params_generator(model, torch.float32))
+
+        assert set(results) == {"layers.0.q_proj.weight"}
+        torch.testing.assert_close(results["layers.0.q_proj.weight"], merged)
+
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
