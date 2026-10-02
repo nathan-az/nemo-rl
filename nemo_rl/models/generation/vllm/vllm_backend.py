@@ -882,6 +882,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         method = getattr(spec_config, "method", None) if spec_config else None
         if method not in ("deepseek_mtp", "mtp"):
             return False
+        # A drafter with its own checkpoint (e.g. Gemma-4's separate *-assistant repo, which
+        # vLLM normalizes from method gemma4_mtp to "mtp") has no weights in the policy stream:
+        # feeding it the stream fails on the first policy-only name (model.vision_tower).
+        draft_model_config = getattr(spec_config, "draft_model_config", None)
+        target_model = getattr(self.model_runner.vllm_config.model_config, "model", None)
+        if draft_model_config is not None and draft_model_config.model != target_model:
+            return False
         if self._get_drafter_model() is None:
             # Silently skipping here is how vLLM 0.29's runner rename went
             # unnoticed: the drafter kept its dummy load-time weights and MTP
