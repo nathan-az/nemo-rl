@@ -756,6 +756,18 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
+    def _mtp_drafter_has_own_checkpoint(self, spec_config: Any) -> bool:
+        """Whether vLLM loaded the drafter from a checkpoint other than the target's."""
+        draft_path = getattr(
+            getattr(spec_config, "draft_model_config", None), "model", None
+        )
+        target_config = getattr(self.model_runner.vllm_config, "model_config", None)
+        target_paths = {
+            getattr(target_config, "model", None),
+            getattr(target_config, "model_weights", None),
+        } - {None, ""}
+        return bool(draft_path and target_paths and draft_path not in target_paths)
+
     def _mtp_drafter_refit_enabled(self) -> bool:
         """Whether MTP drafter weights should be refreshed from the refit stream.
 
@@ -778,9 +790,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # A drafter with its own checkpoint (e.g. Gemma-4's separate *-assistant repo, which
         # vLLM normalizes from method gemma4_mtp to "mtp") has no weights in the policy stream:
         # feeding it the stream fails on the first policy-only name (model.vision_tower).
-        draft_model_config = getattr(spec_config, "draft_model_config", None)
-        target_model = getattr(self.model_runner.vllm_config.model_config, "model", None)
-        if draft_model_config is not None and draft_model_config.model != target_model:
+        # vLLM points a same-checkpoint drafter at the target's model_weights when set (e.g.
+        # runai_streamer, where model is a local cache dir), so either target path counts.
+        if self._mtp_drafter_has_own_checkpoint(spec_config):
             return False
         return self._get_drafter_model() is not None
 
