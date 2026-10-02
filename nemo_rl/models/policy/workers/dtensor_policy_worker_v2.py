@@ -116,7 +116,14 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
-    module_map = dict(model.named_modules())
+    # state_dict() keys drop activation checkpointing's "._checkpoint_wrapped_module" (a
+    # CheckpointWrapper state_dict hook strips it) but named_modules() keeps it, so look modules
+    # up by the stripped name. Keyed by the raw name, no LinearLoRA is ever found with
+    # activation_checkpointing on, and refit ships the unmerged base weights to vLLM.
+    module_map = {
+        n.replace("._checkpoint_wrapped_module", ""): m
+        for n, m in model.named_modules()
+    }
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
