@@ -139,6 +139,7 @@ def _make_mtp_refit_extension(
     from_disk=False,
     has_drafter=True,
     draft_model_config=None,
+    target_model_config=None,
     runner="legacy",
 ):
     """Build an extension for exercising the MTP-refit drafter gating.
@@ -169,7 +170,9 @@ def _make_mtp_refit_extension(
     assert runner in ("legacy", "v2")
     owner_attr = "drafter" if runner == "legacy" else "speculator"
     ext.model_runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(speculative_config=spec_config),
+        vllm_config=SimpleNamespace(
+            speculative_config=spec_config, model_config=target_model_config
+        ),
         **{owner_attr: SimpleNamespace(model=drafter_model) if has_drafter else None},
     )
     return ext, drafter_model
@@ -2422,6 +2425,37 @@ def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
     """The refit-into-drafter path only fires for a co-trained MTP drafter."""
     ext, _ = _make_mtp_refit_extension(
         method=method, from_disk=from_disk, has_drafter=has_drafter
+    )
+    assert ext._mtp_drafter_refit_enabled() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "draft_path, target_model, target_model_weights, expected",
+    [
+        # vLLM's default for an in-checkpoint MTP head: the draft model is the target.
+        ("org/policy", "org/policy", "", True),
+        # runai_streamer: model is a local cache dir, the drafter keeps model_weights.
+        ("s3://bucket/policy", "/cache/policy", "s3://bucket/policy", True),
+        # Gemma-4 assistant: method gemma4_mtp, normalized to "mtp", own checkpoint.
+        ("org/policy-assistant", "org/policy", "", False),
+    ],
+)
+def test_mtp_drafter_refit_skips_drafter_with_own_checkpoint(
+    draft_path, target_model, target_model_weights, expected
+):
+    """Only a drafter served from the target checkpoint takes the policy refit stream.
+
+    A drafter from its own checkpoint has no weights in that stream; feeding it the
+    stream failed the first refit on a policy-only name (model.vision_tower).
+    """
+    ext, _ = _make_mtp_refit_extension(
+        method="mtp",
+        from_disk=False,
+        draft_model_config=SimpleNamespace(model=draft_path),
+        target_model_config=SimpleNamespace(
+            model=target_model, model_weights=target_model_weights
+        ),
     )
     assert ext._mtp_drafter_refit_enabled() is expected
 
