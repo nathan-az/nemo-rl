@@ -136,7 +136,9 @@ class PY_EXECUTABLES:
         """Rewrite every uv command constant to the system executable when the flag is set."""
         if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
             return
-        for name in [n for n in vars(cls) if n.isupper()]:
+        # Skip private names: "_EXTRAS_BY_NAME".isupper() is True, and clobbering that map
+        # with a string breaks _resolve_explicit_overrides when both env vars are set.
+        for name in [n for n in vars(cls) if n.isupper() and not n.startswith("_")]:
             setattr(cls, name, cls.SYSTEM)
 
     @classmethod
