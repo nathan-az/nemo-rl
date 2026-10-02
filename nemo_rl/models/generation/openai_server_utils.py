@@ -24,6 +24,7 @@ so it has no retokenization drift to correct.
 
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -46,7 +47,7 @@ def resolve_terminator_token_ids(
 
     ``config.json``'s ``eos_token_id`` is *not* a substitute. For Gemma-4 it reads
     ``[1, 106]``, omitting ``<|tool_response>``; that is enough to move the splice
-    boundary in :func:`replace_prefix_tokens` onto an earlier ``<turn|>`` and
+    boundary in :func:`splice_prefix_tokens` onto an earlier ``<turn|>`` and
     duplicate a span of tokens without raising.
 
     Args:
@@ -119,13 +120,49 @@ def normalize_tool_call_arguments(
             )
 
 
+@dataclass(frozen=True)
+class PrefixSplice:
+    """Exact token splice and its source coordinates for multimodal ranges."""
+
+    token_ids: list[int]
+    model_cut_end: int
+    template_cut_start: int
+
+
 def replace_prefix_tokens(
     tokenizer: Any,
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    *,
+    eos_token_id: int | None = None,
     terminator_ids: Iterable[int] | None = None,
 ) -> list[int]:
+    """Replace a rendered history with the exact previously generated tokens.
+
+    Thin wrapper over :func:`splice_prefix_tokens` for callers that only need
+    the spliced ids; see that function for the algorithm, ``eos_token_id`` and
+    ``terminator_ids``.
+    """
+    return splice_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+        eos_token_id=eos_token_id,
+        terminator_ids=terminator_ids,
+    ).token_ids
+
+
+def splice_prefix_tokens(
+    *,
+    tokenizer: Any,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+    eos_token_id: int | None = None,
+    terminator_ids: Iterable[int] | None = None,
+) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
     This function is for fixing up the chat template-tokenized messages history
@@ -161,36 +198,13 @@ def replace_prefix_tokens(
     and image tokenization is non-unique, then we will need to uppdate this
     function.
 
-    The splice boundary is located by terminator count, not position: count the
-    terminator tokens in template_prefix_token_ids and cut at the N-th terminator
-    in template_token_ids. This is robust to chat templates that strip reasoning
+    The splice boundary is located by EOS count, not position: count the EOS
+    tokens in template_prefix_token_ids and cut at the N-th EOS in
+    template_token_ids. This is robust to chat templates that strip reasoning
     (<think>) blocks from history when the last message is a user turn -- that
-    shifts token positions but not the per-message terminator count, so counting
-    still finds the same boundary (and reduces to the last terminator of the
-    prefix when nothing is stripped).
-
-    A "terminator" is any token that can end a turn, which is not always the
-    tokenizer's ``eos_token_id``. Callers that know better should pass
-    ``terminator_ids`` from :func:`resolve_terminator_token_ids`; without it this
-    falls back to the scalar ``tokenizer.eos_token_id``, which is correct for
-    models whose turns really do end on EOS (Qwen3, Nemotron) and silently wrong
-    for models like Gemma-4 whose turns end on a distinct control token.
-
-    Args:
-        tokenizer: Used for ``eos_token_id`` when ``terminator_ids`` is omitted,
-            and to detokenize token IDs in assertion messages.
-        model_prefix_token_ids: Tokens the model actually emitted through the end
-            of the last assistant turn. Empty on turn 1.
-        template_prefix_token_ids: Re-render of history up to and including the
-            last assistant turn. Supplies the terminator count.
-        template_token_ids: Re-render of the full prompt for this turn.
-        terminator_ids: Token IDs that may end a turn. Defaults to
-            ``{tokenizer.eos_token_id}``.
-
-    Returns:
-        ``template_token_ids`` with its prefix replaced by the tokens the model
-        actually generated, so the result is a literal extension of
-        ``model_prefix_token_ids``.
+    shifts token positions but not the per-message EOS count, so counting still
+    finds the same boundary (and reduces to the last EOS of the prefix when
+    nothing is stripped).
 
     Example (turn-by-turn, concise; eos_token_id = 2):
         Turn 1:
@@ -206,17 +220,28 @@ def replace_prefix_tokens(
         replace_prefix_tokens keeps the exact prior model tokens up to EOS and
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
+
+    ``eos_token_id`` overrides ``tokenizer.eos_token_id``; with it, ``tokenizer``
+    may be ``None`` (callers that only hold token ids, e.g. the Megatron prompt
+    preparer) and the failure message skips the detokenized reprs.
+
+    ``terminator_ids`` generalizes the single EOS to a set: a turn boundary is any
+    of these tokens, and it takes precedence over ``eos_token_id``. Models whose
+    turns do not end on ``tokenizer.eos_token_id`` need it -- Gemma-4 ends turns on
+    ``<turn|>`` (106) or ``<|tool_response>`` (50) while its tokenizer reports
+    ``<eos>`` (1); see :func:`resolve_terminator_token_ids`.
     """
     if not model_prefix_token_ids:
-        return template_token_ids
+        return PrefixSplice(template_token_ids, 0, 0)
 
-    if terminator_ids is None:
-        eos_token_id = tokenizer.eos_token_id
-        assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
-        terminators = {eos_token_id}
-    else:
+    if terminator_ids is not None:
         terminators = set(terminator_ids)
         assert terminators, "terminator_ids must not be empty when provided"
+    else:
+        if eos_token_id is None:
+            eos_token_id = tokenizer.eos_token_id
+        assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
+        terminators = {eos_token_id}
 
     # The model isn't guaranteed to end on a terminator (e.g. it hit max_tokens);
     # chat templates always add one, so cut the model input to just before it.
@@ -224,9 +249,9 @@ def replace_prefix_tokens(
     if model_prefix_token_ids[-1] in terminators:
         model_cut_end -= 1
 
-    # Locate the turn boundary by terminator count rather than token position.
-    # Qwen3 templates may strip prior reasoning blocks when re-rendering history;
-    # counting preserves the original generated reasoning tokens without
+    # Locate the turn boundary by EOS count rather than token position. Qwen3
+    # templates may strip prior reasoning blocks when re-rendering history;
+    # EOS counting preserves the original generated reasoning tokens without
     # requiring a customized chat template.
     count_needed = sum(1 for tid in template_prefix_token_ids if tid in terminators)
 
@@ -235,14 +260,17 @@ def replace_prefix_tokens(
     # what actually went wrong. The usual cause is a terminator set that does not
     # match the model: Gemma-4's turns end on <turn|> (106) or <|tool_response>
     # (50), so the scalar EOS (1) appears nowhere in a render and the count is 0.
-    assert count_needed > 0, (
-        "No terminator token found in template_prefix_token_ids, so there is no "
-        f"splice boundary to find. Terminators searched for: {sorted(terminators)}.\n"
-        "If this model's turns do not end on tokenizer.eos_token_id, pass "
-        "terminator_ids=resolve_terminator_token_ids(tokenizer, generation_config).\n"
-        f"Template prefix token IDs: {template_prefix_token_ids}\n\n"
-        f"Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}"
-    )
+    if count_needed == 0:
+        message = (
+            "No terminator token found in template_prefix_token_ids, so there is no "
+            f"splice boundary to find. Terminators searched for: {sorted(terminators)}.\n"
+            "If this model's turns do not end on tokenizer.eos_token_id, pass "
+            "terminator_ids=resolve_terminator_token_ids(tokenizer, generation_config).\n"
+            f"Template prefix token IDs: {template_prefix_token_ids}"
+        )
+        if tokenizer is not None:
+            message += f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}"
+        raise AssertionError(message)
 
     count_seen = 0
     template_cut_start = -1
@@ -253,16 +281,24 @@ def replace_prefix_tokens(
                 template_cut_start = pos
                 break
 
-    assert template_cut_start >= 0, (
-        f"Terminator #{count_needed} not found in template_token_ids "
-        f"(only found {count_seen} terminator tokens total, "
-        f"searching for {sorted(terminators)})!\n"
-        f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
-        f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}\n\n"
-        f"Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
-        f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
-    )
+    if template_cut_start < 0:
+        message = (
+            f"EOS token #{count_needed} not found in template_token_ids "
+            f"(only found {count_seen} EOS tokens total, "
+            f"searching for terminators {sorted(terminators)})!\n"
+            f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
+            f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}"
+        )
+        if tokenizer is not None:
+            message += (
+                f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
+                f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
+            )
+        raise AssertionError(message)
 
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    return PrefixSplice(
+        model_prefix_token_ids[:model_cut_end]
+        + template_token_ids[template_cut_start:],
+        model_cut_end,
+        template_cut_start,
     )
